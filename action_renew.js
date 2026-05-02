@@ -226,8 +226,18 @@ function getUsers() {
     return [];
 }
 
-async function attemptTurnstileCdp(page) {
+async function attemptTurnstileCdp(page, debugFrames = false) {
     const frames = page.frames();
+    if (debugFrames) {
+        console.log(`>> [调试] 当前 frames 总数: ${frames.length}`);
+        frames.forEach((f, idx) => {
+            try {
+                console.log(`>> [调试] Frame ${idx}: url=${f.url().substring(0, 120)}`);
+            } catch (e) {
+                console.log(`>> [调试] Frame ${idx}: (无法读取 url)`);
+            }
+        });
+    }
     for (const frame of frames) {
         try {
             const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
@@ -463,7 +473,7 @@ async function attemptTurnstileCdp(page) {
                     console.log('正在检查 Turnstile (使用 CDP 绕过)...');
                     let cdpClickResult = false;
                     for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
+                        cdpClickResult = await attemptTurnstileCdp(page, findAttempt === 0);
                         if (cdpClickResult) break;
                         console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
                         await page.waitForTimeout(1000);
