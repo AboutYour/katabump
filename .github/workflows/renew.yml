@@ -72,7 +72,10 @@ jobs:
 
       - name: Run Renew Script
         env:
-          USERS_JSON: ${{ secrets.USERS_JSON }}      
+          USERS_JSON: ${{ secrets.USERS_JSON }}   
+          HTTP_PROXY: http://127.0.0.1:8080
+          HTTPS_PROXY: http://127.0.0.1:8080
+          NO_PROXY: localhost,127.0.0.1
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
