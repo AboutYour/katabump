@@ -324,6 +324,66 @@ async function hasTurnstileFrame(page) {
     }
 }
 
+
+async function ensureTurnstileWidgetRendered(page, stageName = '登录阶段') {
+    try {
+        const result = await page.evaluate(async () => {
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey]'));
+            const beforeIframeCount = Array.from(document.querySelectorAll('iframe'))
+                .filter((frame) => /turnstile|challenges\.cloudflare/i.test(frame.src || '')).length;
+
+            if (!containers.length) {
+                return { ok: false, reason: 'no_container', beforeIframeCount, afterIframeCount: beforeIframeCount };
+            }
+
+            for (let i = 0; i < 50 && typeof window.turnstile === 'undefined'; i++) {
+                await sleep(200);
+            }
+            if (typeof window.turnstile === 'undefined' || typeof window.turnstile.render !== 'function') {
+                return { ok: false, reason: 'turnstile_api_not_ready', beforeIframeCount, afterIframeCount: beforeIframeCount };
+            }
+
+            let rendered = 0;
+            for (const container of containers) {
+                const sitekey = container.getAttribute('data-sitekey');
+                const hasIframe = !!container.querySelector('iframe');
+                if (!sitekey || hasIframe || container.dataset.__kbRendered === '1') continue;
+
+                container.dataset.__kbRendered = '1';
+                window.turnstile.render(container, {
+                    sitekey,
+                    action: container.getAttribute('data-action') || undefined,
+                    theme: container.getAttribute('data-theme') || 'auto',
+                    callback: (token) => {
+                        const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                        inputs.forEach((input) => { input.value = token || ''; });
+                    },
+                    'expired-callback': () => {
+                        const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                        inputs.forEach((input) => { input.value = ''; });
+                    },
+                    'error-callback': () => {
+                        const inputs = document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]');
+                        inputs.forEach((input) => { input.value = ''; });
+                    }
+                });
+                rendered++;
+            }
+
+            await sleep(1500);
+            const afterIframeCount = Array.from(document.querySelectorAll('iframe'))
+                .filter((frame) => /turnstile|challenges\.cloudflare/i.test(frame.src || '')).length;
+            return { ok: rendered > 0 || afterIframeCount > beforeIframeCount, reason: rendered > 0 ? 'render_called' : 'already_rendered_or_no_sitekey', rendered, beforeIframeCount, afterIframeCount };
+        });
+        console.log(`[${stageName}] Turnstile 渲染检查: ${JSON.stringify(result)}`);
+        return result;
+    } catch (e) {
+        console.log(`[${stageName}] Turnstile 渲染检查失败: ${e.message}`);
+        return { ok: false, reason: e.message };
+    }
+}
+
 async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs = LOGIN_TURNSTILE_WAIT_MS) {
     console.log(`[${stageName}] 检查 Cloudflare Turnstile token...`);
 
@@ -348,6 +408,18 @@ async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs
         hasCaptchaText: firstState.hasCaptchaText
     })}`);
 
+    // 页面已经加载了 Turnstile API 和容器，但 iframe 没出来时，主动调用官方 render。
+    // 这不是模拟点击/绕过验证码，只是修复 widget 没有自动渲染导致 token 永远为空的问题。
+    if (firstState.iframeCount === 0 && firstState.containerCount > 0 && firstState.turnstileObject) {
+        await ensureTurnstileWidgetRendered(page, stageName);
+        await page.waitForTimeout(2000);
+        const renderedState = await getTurnstileState(page);
+        if (renderedState.token) {
+            console.log(`[${stageName}] ✅ 手动渲染官方 Turnstile 后已获得 token，长度: ${renderedState.token.length}`);
+            return true;
+        }
+    }
+
     const start = Date.now();
     let lastLogAt = 0;
     let reloadedOnce = false;
@@ -366,6 +438,8 @@ async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs
             console.log(`[${stageName}] Turnstile response input 存在但 iframe 未渲染，刷新登录页重试一次...`);
             await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
             await page.waitForTimeout(3000);
+            await ensureTurnstileWidgetRendered(page, stageName);
+            await page.waitForTimeout(2000);
             continue;
         }
 
