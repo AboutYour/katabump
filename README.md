@@ -1,137 +1,170 @@
-# Katabump Server Auto-Renewal Tool
+# Katabump Server Auto-Renewal
 
-[English Version](README_EN.md) | [中文说明](README.md)
+基于 [XCQ0607/katabump](https://github.com/XCQ0607/katabump) 优化：全协议代理、随机时间签到、ALTCHA/Turnstile 验证码自动绕过。
 
-这是一个用于自动续期 Katabump 服务器的自动化脚本。它利用 Playwright 和 CDP (Chrome DevTools Protocol) 技术来模拟用户操作，能够有效绕过 Cloudflare Turnstile 验证码，确保持续的服务器服务。
-
-支持 **Windows 本地运行** 和 **GitHub Actions 云端运行**。
-
-## ✨ 特性
-
-- **智能过盾**: 通过 CDP 协议模拟真实鼠标轨迹和点击行为，结合屏幕坐标伪造，高成功率绕过 Cloudflare Turnstile。
-- **自动重试**: 内置严格的验证重试机制，如果验证失败会自动重启验证流程。
-- **多用户支持**: 支持配置多个账号批量续期。
-- **云端/本地**: 既可以在本地电脑跑，也可以利用 GitHub Actions 每天定时自动跑。
+> 每天自动登录 katabump 面板进行一次续期，防止免费服务器过期被回收。
 
 ---
 
-## 🚀 GitHub Actions 云端运行 (推荐)
+## 🚀 GitHub Actions 云端运行（推荐）
 
-这是最省心的方式，配置一次即可每天自动执行。
+配置一次即可每天自动执行，无需本地电脑。
 
-1. **Fork 本仓库** 到你的 GitHub 账号。
-2. 进入你的仓库，点击 **Settings** -> **Secrets and variables** -> **Actions**。
-3. 点击 **New repository secret**，添加一个名为 `USERS_JSON` 的 Secret。
-4. **Value** 的格式必须是 JSON 数组（请尽量压缩为一行）：
-   ```json
-   [{"username": "your_email@example.com", "password": "your_password"}, {"username": "another@example.com", "password": "pwd"}]
-   ```
-5. **(可选) 配置代理**:
-   如果 GitHub Actions 的 IP 被屏蔽，或者你想使用特定的 IP 访问，可以添加名为 `HTTP_PROXY` 的 Secret。
-   - **格式**:
-     - 无认证: `http://ip:port`
-     -带认证: `http://username:password@ip:port`
-   - **说明**: 脚本会自动检测代理有效性，如果支持认证会自动处理。默认不启用。
+### 1. Fork 本仓库
 
-6. **(可选) Telegram 消息推送**:
-   如果你希望在续期成功、失败或跳过时收到 Telegram 通知（包含截图），请配置以下 Secret：
-   - `TG_BOT_TOKEN`: 你的 Telegram Bot Token (从 @BotFather 获取)。
-   - `TG_CHAT_ID`: 你的 Chat ID (用户 ID 或群组 ID)。
-   > 如果未配置，脚本将跳过发送通知。
+点击右上角 **Fork** 到你的 GitHub 账号。
 
-### 4. 运行结果与截图
+### 2. 配置 Secrets
 
-- **运行日志**: 在 Actions 中的 `Run Renew Script` 步骤查看。
-- **截图留存**: 每次运行（无论成功与否），通过 `Upload Screenshots` 步骤自动上传截图。
-  - 你可以在 Workflow 运行详情页的 **Artifacts** 区域下载 `screenshots` 压缩包。
-  - 每个账号对应一张截图（`username.png`），方便确认状态。
+进入你的仓库 → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**：
 
-5. 保存后，进入 **Actions** 页面，启用 Workflow。它会在**每天北京时间 08:00 (UTC 00:00)** 自动运行。
-6. 你也可以手动点击 "Run workflow" 立即测试。
+#### 必填
+
+| Secret | 说明 | 格式 |
+|--------|------|------|
+| `USERS_JSON` | Katabump 账号列表 | `[{"username":"your@email.com","password":"123456"}]` |
+
+#### 选填
+
+| Secret | 说明 |
+|--------|------|
+| `PROXY_URL` | 代理订阅链接（支持 vmess/vless/hy2/tuic/socks5 全协议），脚本自动用 sing-box 启动本地代理 |
+| `HTTP_PROXY` | 简单 HTTP 代理，格式 `http://user:pass@host:port`（`PROXY_URL` 未设置时的 fallback） |
+| `TG_BOT_TOKEN` | Telegram Bot Token，用于推送续期结果通知 |
+| `TG_CHAT_ID` | Telegram 接收通知的 Chat ID |
+
+### 3. 启用 Workflow
+
+进入 **Actions** 页面，点击 **I understand my workflows, go ahead and enable them**。
+
+| 触发方式 | 说明 |
+|---------|------|
+| ⏰ 定时触发 | 每天 **北京时间 08:00 (UTC 00:00)** 自动运行 |
+| 👆 手动触发 | 点击 **Run workflow** 立即测试（无随机延迟） |
+
+### 4. 查看结果
+
+- **日志**：Actions 运行详情页的 `Run Renew Script` 步骤
+- **截图**：每次运行后，通过 `Upload Screenshots` 步骤上传到 Artifacts，可下载查看每个账号的最终页面状态
+
+### 防检测
+
+定时触发的任务会自动随机延迟 **0~3 小时**再执行，防止被目标站识别为固定时间自动化。
 
 ---
 
-## 💻 Windows 本地运行指南
+## 💻 本地运行（Windows 调试用）
 
-如果你想在本地观察运行过程或进行调试，请按以下步骤操作。
+适合本地调试或想观察浏览器操作过程。
 
-### 1. 环境准备
-
-确保你已经安装了 [Node.js](https://nodejs.org/) (建议版本 v18+)。
-
-### 2. 安装依赖
-
-在项目根目录打开终端 (PowerShell 或 CMD)，运行：
+### 环境准备
 
 ```bash
+node -v   # 需 v18+
 npm install
 ```
 
-### 3. 配置账号
+### 配置账号
 
-项目中有一个 `login.json.template` 模板文件。
+```bash
+cp login.json.template login.json
+```
 
-1. 将其**重命名**为 `login.json`。
-2. 用记事本或编辑器打开，填入你的账号密码：
-   ```json
-   [
-       {
-           "username": "myemail@gmail.com",
-           "password": "mypassword123"
-       }
-   ]
-   ```
+编辑 `login.json`：
 
-   > **注意**: `login.json` 已被加入 `.gitignore`，不会被上传到 GitHub，请放心使用。
-   >
+```json
+[
+    {
+        "username": "your@email.com",
+        "password": "your_password"
+    }
+]
+```
 
-### 4. 配置 Chrome 路径
+> `login.json` 已在 `.gitignore` 中，不会被提交到 GitHub。
 
-打开 `renew.js` 文件，找到第 11-12 行：
+### 配置 Chrome
+
+编辑 `renew.js` 顶部几行：
 
 ```javascript
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
-const USER_DATA_DIR = path.join(__dirname, 'ChromeData_Katabump');
-const HEADLESS = true;
+const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"; // 你的 Chrome 路径
+const USER_DATA_DIR = path.join(__dirname, 'ChromeData_Katabump');               // 缓存目录
+const HEADLESS = true;  // true=后台运行, false=可见窗口
 ```
 
-* **CHROME_PATH**: 这是你本地 Chrome 浏览器的安装路径。如果你的安装位置不同，请务必修改！
-* **USER_DATA_DIR**:
-  * 这是一个用于存放 Script 运行时产生的浏览器数据（缓存、Cookie、登录状态等）的文件夹。
-  * **作用**: 它能让你的登录状态保持更久，不需要每次运行都重新输入密码。
-  * **能不能删？**: **可以删**。如果你想要重置所有状态（彻底清除缓存），只需删除这个文件夹即可。脚本下次运行时会自动重新创建它。
-* **HEADLESS**:
-  * `false`: 脚本运行时会弹出一个 Chrome 窗口，你可以看到它在做什么。
-  * `true`: (默认)脚本在后台无头运行，界面不可见（适合只想静默完成任务时开启）。
+### 运行
 
-### 3. 运行脚本
-
-如果你需要使用代理运行脚本，请设置环境变量 `HTTP_PROXY`：
-
-**Powershell:**
-```powershell
-$env:HTTP_PROXY="http://user:pass@127.0.0.1:7890"
-node renew.js
-```
-
-**CMD:**
-```cmd
-set HTTP_PROXY=http://user:pass@127.0.0.1:7890
-node renew.js
-```
-
-如果不设置代理，直接运行：
 ```bash
+# 不带代理
+node renew.js
+
+# 带代理
+set HTTP_PROXY=http://127.0.0.1:7890
 node renew.js
 ```
 
-脚本会自动启动 Chrome (如果需要)，逐个处理账号，并在根目录下的 `photo/` 文件夹中保存每个账号运行结束时的截图（`账号名.png`）。窗口（默认无头模式为 false，你可以看到操作过程），并依次为列表中的用户续期。
+运行截图保存在 `screenshots/` 目录（每个账号一张）。
 
 ---
 
 ## 🛠️ 项目结构
 
-* `renew.js`: Windows 本地运行的主程序。
-* `action_renew.js`: 专门用于 GitHub Actions 环境的脚本（适配 Linux/Headless）。
-* `.github/workflows/renew.yml`: GitHub Actions 的定时任务配置文件。
-* `login.json`: (需手动创建) 存放本地运行的账号信息。
+```
+├── action_renew.js          # GitHub Actions 用主脚本（含随机延迟、sing-box 代理）
+├── renew.js                 # Windows 本地运行脚本
+├── proxy_handler.py         # 代理协议解析器 → 生成 sing-box 配置
+├── package.json             # Node.js 依赖
+├── login.json.template      # 账号模板（本地用）
+├── start_chrome.bat         # 快速启动 Chrome 远程调试（Windows）
+└── .github/workflows/
+    └── renew.yml            # GitHub Actions 定时任务配置
+```
+
+## 🔄 工作流程
+
+```
+GitHub Actions (UTC 00:00)
+  │
+  ├─ 随机延迟 0~3h（仅定时触发）
+  │
+  ├─ [选填] 下载 sing-box → 解析 PROXY_URL → 启动本地 HTTP 代理
+  │
+  ├─ 启动 Chrome（无头模式 via xvfb）
+  │
+  └─ 遍历每个账号 →
+       ├─ 访问登录页
+       ├─ 绕过 Cloudflare Turnstile（CDP 点击）
+       ├─ 输入凭据登录
+       ├─ 进入续期页面
+       ├─ 绕过 ALTCHA 验证码（CDP 点击）
+       ├─ 点击续期按钮
+       └─ 截图 → 上传 Artifacts / 推送 Telegram
+```
+
+## 📸 验证码绕过说明
+
+脚本使用了两种自动绕过方案：
+
+### Cloudflare Turnstile
+
+通过 CDP (Chrome DevTools Protocol) 监听 shadow DOM 中的 checkbox，获取其在页面中的精确坐标后模拟鼠标点击。
+
+### ALTCHA
+
+监听 DOM 中 ALTCHA widget 的状态，自动在验证成功的时刻获取 token 并提交表单。支持 `click` 和 `pointer` 两种交互模式。
+
+---
+
+## 📝 注意事项
+
+- **PROXY_URL 优先于 HTTP_PROXY**：如果同时设置了两个，脚本优先使用 sing-box 代理
+- **Token 安全**：`CF_TUNNEL_TOKEN` 等敏感值请通过 GitHub Secrets 传入，不要硬编码在代码中
+- **免费额度**：请合理使用，流量过大可能导致厂商封禁
+
+---
+
+## 致谢
+
+- [XCQ0607/katabump](https://github.com/XCQ0607/katabump) — 原版项目
+- [SagerNet/sing-box](https://github.com/SagerNet/sing-box) — 通用代理平台
