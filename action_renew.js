@@ -214,7 +214,7 @@ async function launchBrowser() {
     if (PROXY_CONFIG) {
         launchOptions.proxy = {
             server: PROXY_CONFIG.server,
-            bypass: ['localhost', '127.0.0.1'],
+            bypass: 'localhost,127.0.0.1',
         };
         if (PROXY_CONFIG.username) launchOptions.proxy.username = PROXY_CONFIG.username;
         if (PROXY_CONFIG.password) launchOptions.proxy.password = PROXY_CONFIG.password;
