@@ -69,52 +69,13 @@ if (HTTP_PROXY) {
     }
 }
 
-// --- 注入脚本：Hook Shadow DOM 获取 Turnstile 坐标 ---
-const INJECTED_SCRIPT = `
-(function() {
-    if (window.self === window.top) return;
-    try {
-        function getRandomInt(min, max) {
-            return Math.floor(Math.random() * (max - min + 1)) + min;
-        }
-        let screenX = getRandomInt(800, 1200);
-        let screenY = getRandomInt(400, 600);
-        Object.defineProperty(MouseEvent.prototype, 'screenX', { value: screenX });
-        Object.defineProperty(MouseEvent.prototype, 'screenY', { value: screenY });
-    } catch (e) { }
+// --- Cloudflare Turnstile 说明 ---
+// 不再注入 Shadow DOM / CDP 自动点击脚本。Turnstile 是反自动化验证，
+// 自动模拟点击通常不会产生有效 token，反而导致登录失败。
+const INJECTED_SCRIPT = '';
 
-    try {
-        const originalAttachShadow = Element.prototype.attachShadow;
-        Element.prototype.attachShadow = function(init) {
-            const shadowRoot = originalAttachShadow.call(this, init);
-            if (shadowRoot) {
-                const checkAndReport = () => {
-                    const checkbox = shadowRoot.querySelector('input[type="checkbox"]');
-                    if (checkbox) {
-                        const rect = checkbox.getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
-                            const xRatio = (rect.left + rect.width / 2) / window.innerWidth;
-                            const yRatio = (rect.top + rect.height / 2) / window.innerHeight;
-                            window.__turnstile_data = { xRatio, yRatio };
-                            return true;
-                        }
-                    }
-                    return false;
-                };
-                if (!checkAndReport()) {
-                    const observer = new MutationObserver(() => {
-                        if (checkAndReport()) observer.disconnect();
-                    });
-                    observer.observe(shadowRoot, { childList: true, subtree: true });
-                }
-            }
-            return shadowRoot;
-        };
-    } catch (e) {
-        console.error('[注入] Hook attachShadow 失败:', e);
-    }
-})();
-`;
+const LOGIN_TURNSTILE_WAIT_MS = parseInt(process.env.LOGIN_TURNSTILE_WAIT_MS || '120000', 10);
+const LOGIN_SUBMIT_WAIT_MS = parseInt(process.env.LOGIN_SUBMIT_WAIT_MS || '30000', 10);
 
 async function checkProxy() {
     if (!PROXY_CONFIG) return true;
@@ -309,44 +270,15 @@ async function dispatchCdpClick(page, x, y) {
 // ==========================================
 // ========== 1. TURNSTILE 专区 (登录用) ========
 // ==========================================
-async function attemptTurnstileCdp(page) {
-    const frames = page.frames();
-    for (const frame of frames) {
-        try {
-            const data = await frame.evaluate(() => window.__turnstile_data).catch(() => null);
-            if (data) {
-                console.log('>> 发现 Turnstile 数据。比例:', data);
-                await frame.evaluate(() => { window.__turnstile_data = null; }).catch(() => {});
-                const iframeElement = await frame.frameElement();
-                if (!iframeElement) continue;
-                const box = await iframeElement.boundingBox();
-                if (!box) continue;
-                const clickX = box.x + (box.width * data.xRatio);
-                const clickY = box.y + (box.height * data.yRatio);
-                return await dispatchCdpClick(page, clickX, clickY);
-            }
-        } catch (e) { }
-    }
-    return false;
-}
-
-async function checkTurnstileSuccess(page) {
+async function getTurnstileToken(page) {
     try {
-        const hasResponseToken = await page.locator('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').evaluateAll(elements => {
-            return elements.some(el => el.value && el.value.trim().length > 0);
+        return await page.locator('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]').evaluateAll((elements) => {
+            const found = elements.map((el) => (el.value || '').trim()).find((value) => value.length > 20);
+            return found || '';
         });
-        if (hasResponseToken) return true;
-    } catch (e) { }
-
-    const frames = page.frames();
-    for (const f of frames) {
-        if (f.url().includes('cloudflare')) {
-            try {
-                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) return true;
-            } catch (e) { }
-        }
+    } catch (e) {
+        return '';
     }
-    return false;
 }
 
 async function hasTurnstileFrame(page) {
@@ -358,36 +290,36 @@ async function hasTurnstileFrame(page) {
     }
 }
 
-async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts = 10, waitAfterClick = 5000) {
-    console.log(`[${stageName}] 开始检测 Cloudflare Turnstile...`);
-    let sawTurnstile = false;
-    for (let i = 0; i < maxAttempts; i++) {
-        if (await hasTurnstileFrame(page)) sawTurnstile = true;
+async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs = LOGIN_TURNSTILE_WAIT_MS) {
+    console.log(`[${stageName}] 检查 Cloudflare Turnstile token...`);
 
-        if (await checkTurnstileSuccess(page)) {
-            console.log(`[${stageName}] ✅ Turnstile 已通过验证。`);
+    const start = Date.now();
+    let lastLogAt = 0;
+
+    while (Date.now() - start < timeoutMs) {
+        const token = await getTurnstileToken(page);
+        if (token) {
+            console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${token.length}`);
             return true;
         }
 
-        const clicked = await attemptTurnstileCdp(page);
-        if (clicked) {
-            sawTurnstile = true;
-            console.log(`[${stageName}] 已点击 Turnstile，等待验证结果 (${waitAfterClick}ms)...`);
-            await page.waitForTimeout(waitAfterClick);
-
-            if (await checkTurnstileSuccess(page)) {
-                console.log(`[${stageName}] ✅ Turnstile 验证通过！`);
-                return true;
-            }
-            console.log(`[${stageName}] ⚠️ 点击后验证未通过，继续重试...`);
+        const hasFrame = await hasTurnstileFrame(page);
+        if (!hasFrame) {
+            console.log(`[${stageName}] 未检测到 Turnstile iframe，继续登录流程。`);
+            return true;
         }
-        if (i < maxAttempts - 1) await page.waitForTimeout(1000);
+
+        if (Date.now() - lastLogAt > 10000) {
+            const waited = Math.ceil((Date.now() - start) / 1000);
+            console.log(`[${stageName}] 检测到 Turnstile，但 token 尚未生成。已等待 ${waited}s/${Math.ceil(timeoutMs / 1000)}s。`);
+            console.log(`[${stageName}] 请在打开的 Chrome 窗口中手动完成 Cloudflare 验证；脚本不会自动点击/绕过 Turnstile。`);
+            lastLogAt = Date.now();
+        }
+
+        await page.waitForTimeout(1000);
     }
-    if (!sawTurnstile) {
-        console.log(`[${stageName}] 未检测到 Turnstile。`);
-        return true;
-    }
-    console.log(`[${stageName}] 检测到 Turnstile，但未能通过验证。`);
+
+    console.log(`[${stageName}] ❌ 等待 Turnstile token 超时。`);
     return false;
 }
 
@@ -722,7 +654,7 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
             await page.waitForTimeout(3000); 
 
             // ➡️ 【登录阶段专属】：解决 Turnstile
-            await solveTurnstileIfPresent(page, "登录阶段", 10, 5000);
+            await waitForTurnstileToken(page, "登录阶段", LOGIN_TURNSTILE_WAIT_MS);
 
             console.log('正在输入凭据...');
             try {
@@ -744,7 +676,10 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await pwdInput.fill(user.password);
 
                 // Cloudflare 可能显示“成功”但 token 写入/表单解锁会慢一点，提交前再确认一次。
-                await solveTurnstileIfPresent(page, "提交前复检", 3, 3000);
+                const tokenOk = await waitForTurnstileToken(page, "提交前复检", LOGIN_TURNSTILE_WAIT_MS);
+                if (!tokenOk) {
+                    throw new Error('Cloudflare Turnstile token 未生成，不能提交登录');
+                }
 
                 await loginBtn.waitFor({ state: 'visible', timeout: 10000 });
                 await loginBtn.scrollIntoViewIfNeeded().catch(() => {});
@@ -752,23 +687,11 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
 
                 console.log('点击 Login 并等待页面跳转/接口响应...');
                 await Promise.allSettled([
-                    page.waitForURL(url => !String(url).includes('/auth/login'), { timeout: 30000 }),
-                    page.waitForLoadState('networkidle', { timeout: 30000 }),
+                    page.waitForURL(url => !String(url).includes('/auth/login'), { timeout: LOGIN_SUBMIT_WAIT_MS }),
+                    page.waitForLoadState('networkidle', { timeout: LOGIN_SUBMIT_WAIT_MS }),
                     loginBtn.click()
                 ]);
 
-                // 如果按钮点击没触发表单，兜底直接 submit 表单。
-                if (page.url().includes('/auth/login')) {
-                    console.log('点击后仍在登录页，尝试通过表单 submit 兜底...');
-                    await page.evaluate(() => {
-                        const form = document.querySelector('form');
-                        if (form) form.requestSubmit ? form.requestSubmit() : form.submit();
-                    });
-                    await Promise.race([
-                        page.waitForURL(url => !String(url).includes('/auth/login'), { timeout: 30000 }).catch(() => null),
-                        page.waitForTimeout(30000)
-                    ]);
-                }
 
                 // 检查登录错误
                 try {
