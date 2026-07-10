@@ -293,6 +293,20 @@ async function hasTurnstileFrame(page) {
 async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs = LOGIN_TURNSTILE_WAIT_MS) {
     console.log(`[${stageName}] 检查 Cloudflare Turnstile token...`);
 
+    const hasFrameInitially = await hasTurnstileFrame(page);
+    const tokenInitially = await getTurnstileToken(page);
+    if (tokenInitially) {
+        console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${tokenInitially.length}`);
+        return true;
+    }
+
+    // 页面完全没有 Turnstile iframe 时，不把它当成 Cloudflare 失败。
+    // 这种情况更可能是：本次没有触发挑战、账号密码/CSRF/接口响应问题、或站点策略拦截。
+    if (!hasFrameInitially) {
+        console.log(`[${stageName}] 未检测到 Turnstile iframe/token，本次登录页可能未触发 Cloudflare 挑战。`);
+        return true;
+    }
+
     const start = Date.now();
     let lastLogAt = 0;
 
@@ -305,8 +319,7 @@ async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs
 
         const hasFrame = await hasTurnstileFrame(page);
         if (!hasFrame) {
-            console.log(`[${stageName}] 未检测到 Turnstile iframe，继续登录流程。`);
-            return true;
+            console.log(`[${stageName}] Turnstile iframe 已消失，但未读取到 cf-turnstile-response。等待页面写入 token...`);
         }
 
         if (Date.now() - lastLogAt > 10000) {
@@ -321,6 +334,78 @@ async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs
 
     console.log(`[${stageName}] ❌ 等待 Turnstile token 超时。`);
     return false;
+}
+
+async function getLoginDiagnostics(page) {
+    return await page.evaluate(() => {
+        const pickText = (selector) => Array.from(document.querySelectorAll(selector))
+            .map((el) => (el.innerText || el.textContent || '').trim())
+            .filter(Boolean)
+            .slice(0, 8);
+        const submit = document.querySelector('#submit, button[type="submit"]');
+        const form = submit ? submit.closest('form') : document.querySelector('form');
+        const hiddenInputs = Array.from(document.querySelectorAll('input[type="hidden"], textarea[name]'))
+            .map((el) => ({ name: el.getAttribute('name') || '', valueLength: (el.value || '').length }))
+            .slice(0, 30);
+        return {
+            url: location.href,
+            title: document.title,
+            submitText: submit ? (submit.innerText || submit.textContent || '').trim() : '',
+            submitDisabled: submit ? Boolean(submit.disabled || submit.getAttribute('aria-disabled') === 'true') : null,
+            formAction: form ? form.action : '',
+            formMethod: form ? form.method : '',
+            alerts: pickText('[role="alert"], .alert, .invalid-feedback, .text-danger, .text-red-500, .error'),
+            pageHints: pickText('body'),
+            hiddenInputs
+        };
+    }).catch((e) => ({ error: e.message }));
+}
+
+async function logLoginDiagnostics(page, prefix = '登录诊断') {
+    const diag = await getLoginDiagnostics(page);
+    console.log(`[${prefix}] ${JSON.stringify(diag, null, 2).slice(0, 4000)}`);
+    try {
+        const cookies = await page.context().cookies('https://dashboard.katabump.com');
+        const safeCookies = cookies.map((c) => ({ name: c.name, domain: c.domain, expires: c.expires, valueLength: (c.value || '').length }));
+        console.log(`[${prefix}] cookies=${JSON.stringify(safeCookies).slice(0, 2000)}`);
+    } catch (e) {
+        console.log(`[${prefix}] 读取 cookies 失败: ${e.message}`);
+    }
+}
+
+async function clickLoginAndCollectResult(page, loginBtn) {
+    const loginResponses = [];
+    const onResponse = async (res) => {
+        const url = res.url();
+        if (!/\/auth\/login|\/login|signin|session/i.test(url)) return;
+        let body = '';
+        try {
+            const ct = (res.headers()['content-type'] || '').toLowerCase();
+            if (ct.includes('json') || ct.includes('text') || ct.includes('html')) {
+                body = (await res.text()).slice(0, 1200);
+            }
+        } catch (e) {}
+        loginResponses.push({ url, status: res.status(), statusText: res.statusText(), body });
+    };
+
+    page.on('response', onResponse);
+    try {
+        await Promise.allSettled([
+            page.waitForURL((url) => !String(url).includes('/auth/login'), { timeout: LOGIN_SUBMIT_WAIT_MS }),
+            loginBtn.click({ timeout: 15000 })
+        ]);
+        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+        await page.waitForTimeout(3000);
+    } finally {
+        page.off('response', onResponse);
+    }
+
+    if (loginResponses.length > 0) {
+        console.log(`[登录接口响应] ${JSON.stringify(loginResponses, null, 2).slice(0, 4000)}`);
+    } else {
+        console.log('[登录接口响应] 未捕获到明显的登录接口响应，可能前端未提交、按钮被禁用、或请求 URL 非 /login。');
+    }
+    return loginResponses;
 }
 
 
@@ -685,13 +770,23 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 await loginBtn.scrollIntoViewIfNeeded().catch(() => {});
                 await page.waitForTimeout(800);
 
-                console.log('点击 Login 并等待页面跳转/接口响应...');
-                await Promise.allSettled([
-                    page.waitForURL(url => !String(url).includes('/auth/login'), { timeout: LOGIN_SUBMIT_WAIT_MS }),
-                    page.waitForLoadState('networkidle', { timeout: LOGIN_SUBMIT_WAIT_MS }),
-                    loginBtn.click()
-                ]);
+                const submitDisabled = await loginBtn.evaluate((btn) => Boolean(btn.disabled || btn.getAttribute('aria-disabled') === 'true')).catch(() => false);
+                if (submitDisabled) {
+                    await logLoginDiagnostics(page, '提交前诊断');
+                    throw new Error('Login 按钮处于禁用状态，表单未满足提交条件');
+                }
 
+                await logLoginDiagnostics(page, '提交前诊断');
+                console.log('点击 Login 并等待页面跳转/接口响应...');
+                const loginResponses = await clickLoginAndCollectResult(page, loginBtn);
+
+                // 如果登录接口明确返回 4xx/5xx，把接口内容打出来，便于区分密码错误、CSRF、Cloudflare、风控。
+                const badLoginResponse = loginResponses.find((item) => item.status >= 400);
+                if (badLoginResponse) {
+                    console.error(`   >> ❌ 登录接口返回 HTTP ${badLoginResponse.status}: ${badLoginResponse.body || badLoginResponse.statusText}`);
+                }
+
+                await logLoginDiagnostics(page, '提交后诊断');
 
                 // 检查登录错误
                 try {
