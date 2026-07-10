@@ -77,6 +77,40 @@ const INJECTED_SCRIPT = '';
 const LOGIN_TURNSTILE_WAIT_MS = parseInt(process.env.LOGIN_TURNSTILE_WAIT_MS || '120000', 10);
 const LOGIN_SUBMIT_WAIT_MS = parseInt(process.env.LOGIN_SUBMIT_WAIT_MS || '30000', 10);
 
+const LOGIN_FAIL_ON_EMPTY_TURNSTILE = String(process.env.LOGIN_FAIL_ON_EMPTY_TURNSTILE || 'true').toLowerCase() !== 'false';
+
+async function getTurnstileState(page) {
+    return await page.evaluate(() => {
+        const responseEls = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"]'));
+        const responseValues = responseEls.map((el) => String(el.value || '').trim());
+        const token = responseValues.find((value) => value.length > 20) || '';
+        const containers = Array.from(document.querySelectorAll('.cf-turnstile, [data-sitekey], [data-callback], [data-action]')).map((el) => ({
+            tag: el.tagName,
+            cls: el.className || '',
+            sitekey: el.getAttribute('data-sitekey') || '',
+            action: el.getAttribute('data-action') || ''
+        }));
+        const scripts = Array.from(document.scripts).map((s) => s.src || '').filter((src) => /turnstile|challenges\.cloudflare/i.test(src));
+        const iframes = Array.from(document.querySelectorAll('iframe')).map((frame) => frame.src || '').filter((src) => /turnstile|challenges\.cloudflare/i.test(src));
+        const bodyText = (document.body && document.body.innerText || '').slice(0, 2000);
+        const hasCaptchaText = /captcha|cloudflare|turnstile|请完成|complete captcha/i.test(bodyText);
+        return {
+            required: responseEls.length > 0 || containers.length > 0 || scripts.length > 0 || iframes.length > 0 || hasCaptchaText,
+            token,
+            responseInputCount: responseEls.length,
+            responseValueLengths: responseValues.map((value) => value.length),
+            iframeCount: iframes.length,
+            iframes,
+            containerCount: containers.length,
+            containers,
+            scriptCount: scripts.length,
+            scripts,
+            hasCaptchaText,
+            turnstileObject: typeof window.turnstile !== 'undefined'
+        };
+    }).catch(() => ({ required: false, token: '', responseInputCount: 0, responseValueLengths: [], iframeCount: 0, iframes: [], containerCount: 0, containers: [], scriptCount: 0, scripts: [], hasCaptchaText: false, turnstileObject: false }));
+}
+
 async function checkProxy() {
     if (!PROXY_CONFIG) return true;
     console.log('[代理] 正在验证代理连接...');
@@ -293,47 +327,69 @@ async function hasTurnstileFrame(page) {
 async function waitForTurnstileToken(page, stageName = '登录阶段', timeoutMs = LOGIN_TURNSTILE_WAIT_MS) {
     console.log(`[${stageName}] 检查 Cloudflare Turnstile token...`);
 
-    const hasFrameInitially = await hasTurnstileFrame(page);
-    const tokenInitially = await getTurnstileToken(page);
-    if (tokenInitially) {
-        console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${tokenInitially.length}`);
+    const firstState = await getTurnstileState(page);
+    if (firstState.token) {
+        console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${firstState.token.length}`);
         return true;
     }
 
-    // 页面完全没有 Turnstile iframe 时，不把它当成 Cloudflare 失败。
-    // 这种情况更可能是：本次没有触发挑战、账号密码/CSRF/接口响应问题、或站点策略拦截。
-    if (!hasFrameInitially) {
+    if (!firstState.required) {
         console.log(`[${stageName}] 未检测到 Turnstile iframe/token，本次登录页可能未触发 Cloudflare 挑战。`);
         return true;
     }
 
+    console.log(`[${stageName}] 检测到页面需要 Turnstile，但 token 为空。state=${JSON.stringify({
+        responseInputCount: firstState.responseInputCount,
+        responseValueLengths: firstState.responseValueLengths,
+        iframeCount: firstState.iframeCount,
+        containerCount: firstState.containerCount,
+        scriptCount: firstState.scriptCount,
+        turnstileObject: firstState.turnstileObject,
+        hasCaptchaText: firstState.hasCaptchaText
+    })}`);
+
     const start = Date.now();
     let lastLogAt = 0;
+    let reloadedOnce = false;
 
     while (Date.now() - start < timeoutMs) {
-        const token = await getTurnstileToken(page);
-        if (token) {
-            console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${token.length}`);
+        const state = await getTurnstileState(page);
+        if (state.token) {
+            console.log(`[${stageName}] ✅ 已检测到有效 Turnstile token，长度: ${state.token.length}`);
             return true;
         }
 
-        const hasFrame = await hasTurnstileFrame(page);
-        if (!hasFrame) {
-            console.log(`[${stageName}] Turnstile iframe 已消失，但未读取到 cf-turnstile-response。等待页面写入 token...`);
+        // 有些页面先写入隐藏 response input，再异步加载 Turnstile iframe。
+        // 如果一直没有 iframe，刷新一次登录页，让官方脚本重新渲染；不是自动点击/绕过。
+        if (!reloadedOnce && state.required && state.iframeCount === 0 && Date.now() - start > 10000) {
+            reloadedOnce = true;
+            console.log(`[${stageName}] Turnstile response input 存在但 iframe 未渲染，刷新登录页重试一次...`);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+            await page.waitForTimeout(3000);
+            continue;
         }
 
         if (Date.now() - lastLogAt > 10000) {
             const waited = Math.ceil((Date.now() - start) / 1000);
-            console.log(`[${stageName}] 检测到 Turnstile，但 token 尚未生成。已等待 ${waited}s/${Math.ceil(timeoutMs / 1000)}s。`);
-            console.log(`[${stageName}] 请在打开的 Chrome 窗口中手动完成 Cloudflare 验证；脚本不会自动点击/绕过 Turnstile。`);
+            console.log(`[${stageName}] Turnstile token 仍为空，已等待 ${waited}s/${Math.ceil(timeoutMs / 1000)}s。`);
+            console.log(`[${stageName}] 需要在真实浏览器中完成官方 Cloudflare 验证；脚本不会自动点击/绕过 Turnstile。`);
             lastLogAt = Date.now();
         }
 
         await page.waitForTimeout(1000);
     }
 
-    console.log(`[${stageName}] ❌ 等待 Turnstile token 超时。`);
-    return false;
+    const finalState = await getTurnstileState(page);
+    console.log(`[${stageName}] ❌ Turnstile token 仍为空。finalState=${JSON.stringify({
+        responseInputCount: finalState.responseInputCount,
+        responseValueLengths: finalState.responseValueLengths,
+        iframeCount: finalState.iframeCount,
+        containerCount: finalState.containerCount,
+        scriptCount: finalState.scriptCount,
+        turnstileObject: finalState.turnstileObject,
+        hasCaptchaText: finalState.hasCaptchaText
+    })}`);
+    return !LOGIN_FAIL_ON_EMPTY_TURNSTILE;
 }
 
 async function getLoginDiagnostics(page) {
@@ -763,8 +819,15 @@ async function solveAltchaIfPresent(page, stageName = "Renew阶段", maxAttempts
                 // Cloudflare 可能显示“成功”但 token 写入/表单解锁会慢一点，提交前再确认一次。
                 const tokenOk = await waitForTurnstileToken(page, "提交前复检", LOGIN_TURNSTILE_WAIT_MS);
                 if (!tokenOk) {
+                    await logLoginDiagnostics(page, 'Turnstile 未完成诊断');
                     throw new Error('Cloudflare Turnstile token 未生成，不能提交登录');
                 }
+
+                // 如果等待 Turnstile 期间刷新过页面，输入框可能被清空；提交前重新确认并补填。
+                await emailInput.fill('');
+                await emailInput.fill(user.username);
+                await pwdInput.fill('');
+                await pwdInput.fill(user.password);
 
                 await loginBtn.waitFor({ state: 'visible', timeout: 10000 });
                 await loginBtn.scrollIntoViewIfNeeded().catch(() => {});
